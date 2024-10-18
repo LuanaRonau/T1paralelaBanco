@@ -1,0 +1,85 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include <unistd.h>
+
+
+#define num_clients 4
+#define num_accounts 4
+
+
+typedef struct Operation {
+    void (*operationFunction)(struct Operation*); 
+    int value;
+    int accountA;
+    int accountB;
+} Operation;
+
+void withdrawal_deposit(Operation* operation) {
+    printf("Saque/depósito de %d reais feito em conta %d\n", operation->value, operation->accountA);
+}
+
+void transfer(Operation* operation) {
+    printf("Transferência de %d reais feita de conta %d para conta %d\n", operation->value, operation->accountA, operation->accountB);
+}
+
+void *client() {
+
+    void* operations[] = {
+        &withdrawal_deposit,
+        &transfer
+    };
+
+    for(int i = 0; i<4; i++){
+
+        void* operationFunction = operations[rand() % 2];
+
+        int value;
+        int accountA = rand() % num_accounts;
+        int accountB;
+
+        if(operationFunction==&withdrawal_deposit){
+            value = rand() % 2000 - 1000; // Números negativos também
+        } else {
+            value = rand() % 1000;
+
+            accountB = rand() % num_accounts;
+            // Garante que a transferência será para uma conta diferente
+            while(accountA == accountB){
+                accountB = rand() % num_accounts;
+            }
+        }
+
+        Operation o = {
+            .operationFunction = operationFunction,
+            .value = value, 
+            .accountA = accountA,
+            .accountB = accountB
+        };
+        
+        o.operationFunction(&o);     
+
+        sleep(10);
+    }
+
+    pthread_exit(NULL);
+}
+
+int main(int argc, char **argv) {
+    pthread_t id_threads[num_clients];
+
+    for(int i=0; i<num_clients; i++){
+        if(pthread_create(&id_threads[i], NULL, client, NULL) != 0) {
+            fprintf(stderr, "Erro ao criar thread %u\n", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < num_clients; i++) {
+        pthread_join(id_threads[i], NULL); 
+    }
+
+    return 0;
+}
