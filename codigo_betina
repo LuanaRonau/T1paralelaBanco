@@ -1,0 +1,203 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#define NUM_THREADS 4
+#define NUM_ACCOUNTS 10
+
+typedef struct {
+    int account_id;
+    double balance;
+    pthread_mutex_t mutex;  // Mutex para cada conta
+} account_t;
+
+typedef struct task {
+    void (*function)(void *);
+    void *arg;
+    struct task *next;
+} task_t;
+
+typedef struct {
+    task_t *task_queue;
+    pthread_t *threads;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int shutdown;
+    int num_threads;
+} thread_pool_t;
+
+// Estruturas e funções do thread pool
+void *thread_pool_worker(void *arg);
+void thread_pool_init(thread_pool_t *pool, int num_threads);
+void thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *arg);
+void thread_pool_shutdown(thread_pool_t *pool);
+
+// Funções de operação
+void deposit(void *arg);
+void transfer(void *arg);
+void print_balance(void *arg);
+
+// Estruturas globais
+account_t accounts[NUM_ACCOUNTS]; // Contas bancárias
+thread_pool_t pool;                // Pool de threads
+
+int main() {
+    // Inicializa o pool de threads
+    thread_pool_init(&pool, NUM_THREADS);
+
+    // Inicializa as contas
+    for (int i = 0; i < NUM_ACCOUNTS; i++) {
+        accounts[i].account_id = i + 1;
+        accounts[i].balance = 100.0; // Saldo inicial
+        pthread_mutex_init(&accounts[i].mutex, NULL); // Inicializa o mutex
+    }
+
+    // Submissão de tarefas de exemplo
+    int account_id = 1; // Exemplo de ID de conta para depósito
+    thread_pool_submit(&pool, deposit, &account_id);
+    
+    int transfer_ids[2] = {1, 2}; // Transferindo de conta 1 para conta 2
+    thread_pool_submit(&pool, transfer, transfer_ids);
+
+    // Balance geral
+    for (int i = 0; i < NUM_ACCOUNTS; i++) {
+        thread_pool_submit(&pool, print_balance, &accounts[i]);
+    }
+
+    // Aguarda um tempo para as threads terminarem
+    sleep(5);
+    
+    // Finaliza o pool de threads
+    thread_pool_shutdown(&pool);
+
+    // Destrói mutexes das contas
+    for (int i = 0; i < NUM_ACCOUNTS; i++) {
+        pthread_mutex_destroy(&accounts[i].mutex);
+    }
+
+    return 0;
+}
+
+// Função do trabalhador do pool de threads
+void *thread_pool_worker(void *arg) {
+    thread_pool_t *pool = (thread_pool_t *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&pool->lock);
+        while (pool->task_queue == NULL && !pool->shutdown)
+            pthread_cond_wait(&pool->cond, &pool->lock);
+
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&pool->lock);
+            pthread_exit(NULL);
+        }
+
+        // Retira a tarefa da fila
+        task_t *task = pool->task_queue;
+        pool->task_queue = task->next;
+        pthread_mutex_unlock(&pool->lock);
+
+        // Executa a tarefa
+        task->function(task->arg);
+        free(task);
+    }
+}
+
+// Inicializa o pool de threads
+void thread_pool_init(thread_pool_t *pool, int num_threads) {
+    pool->num_threads = num_threads;
+    pool->threads = (pthread_t *)malloc(sizeof(pthread_t) * num_threads);
+    pool->task_queue = NULL;
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->cond, NULL);
+    pool->shutdown = 0;
+
+    for (int i = 0; i < num_threads; ++i)
+        pthread_create(&pool->threads[i], NULL, thread_pool_worker, (void *)pool);
+}
+
+// Submete uma tarefa ao pool de threads
+void thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *arg) {
+    task_t *task = (task_t *)malloc(sizeof(task_t));
+    task->function = function;
+    task->arg = arg;
+    task->next = NULL;
+
+    pthread_mutex_lock(&pool->lock);
+
+    if (pool->task_queue == NULL)
+        pool->task_queue = task;
+    else {
+        task_t *tmp = pool->task_queue;
+        while (tmp->next != NULL)
+            tmp = tmp->next;
+        tmp->next = task;
+    }
+
+    pthread_cond_signal(&pool->cond);
+    pthread_mutex_unlock(&pool->lock);
+}
+
+// Finaliza o pool de threads
+void thread_pool_shutdown(thread_pool_t *pool) {
+    pthread_mutex_lock(&pool->lock);
+    pool->shutdown = 1;
+    pthread_cond_broadcast(&pool->cond);
+    pthread_mutex_unlock(&pool->lock);
+
+    for (int i = 0; i < pool->num_threads; i++)
+        pthread_join(pool->threads[i], NULL);
+
+    free(pool->threads);
+    task_t *task = pool->task_queue;
+
+    while (task != NULL) {
+        task_t *next_task = task->next;
+        free(task);
+        task = next_task;
+    }
+
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->cond);
+}
+
+// Função de depósito
+void deposit(void *arg) {
+    int *account_id = (int *)arg;
+    pthread_mutex_lock(&accounts[*account_id - 1].mutex); // Bloqueia o mutex da conta
+
+    accounts[*account_id - 1].balance += 50; // Deposita R$ 50
+    printf("Depositando R$ 50 na conta %d. Saldo atual: R$ %.2f\n", *account_id, accounts[*account_id - 1].balance);
+
+    pthread_mutex_unlock(&accounts[*account_id - 1].mutex); // Desbloqueia o mutex da conta
+}
+
+// Função de transferência
+void transfer(void *arg) {
+    int *account_ids = (int *)arg;
+    int from_id = account_ids[0] - 1; // Conta de origem
+    int to_id = account_ids[1] - 1;   // Conta de destino
+
+    pthread_mutex_lock(&accounts[from_id].mutex); // Bloqueia o mutex da conta de origem
+    pthread_mutex_lock(&accounts[to_id].mutex);   // Bloqueia o mutex da conta de destino
+
+    if (accounts[from_id].balance >= 50) {
+        accounts[from_id].balance -= 50; // Retira R$ 50 da conta de origem
+        accounts[to_id].balance += 50;   // Adiciona R$ 50 na conta de destino
+        printf("Transferindo R$ 50 de conta %d para conta %d.\n", accounts[from_id].account_id, accounts[to_id].account_id);
+    } else {
+        printf("Transferência falhou: Saldo insuficiente na conta %d.\n", accounts[from_id].account_id);
+    }
+
+    pthread_mutex_unlock(&accounts[to_id].mutex);   // Desbloqueia o mutex da conta de destino
+    pthread_mutex_unlock(&accounts[from_id].mutex); // Desbloqueia o mutex da conta de origem
+}
+
+// Função para imprimir o saldo
+void print_balance(void *arg) {
+    account_t *account = (account_t *)arg;
+    pthread_mutex_lock(&account->mutex); // Bloqueia o mutex da conta
+    printf("Saldo da conta %d: R$ %.2f\n", account->account_id, account->balance);
+    pthread_mutex_unlock(&account->mutex); // Desbloqueia o mutex da conta
+}
