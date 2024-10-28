@@ -1,85 +1,420 @@
+#include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <sys/time.h>
-#include <pthread.h>
 #include <unistd.h>
 
+#define NUM_THREADS 4
+#define MAX_TASKS 10  // Capacidade máxima da fila de tarefas
 
-#define num_clients 4
-#define num_accounts 4
+typedef struct {
+    int id_conta;
+    double saldo;
+    pthread_mutex_t conta_mutex;
+} Conta;
+
+typedef struct {
+    Conta *contas;
+    int quantidade;
+} Banco;
+
+typedef struct {
+    int valor;
+    int conta_id;
+    Banco *banco;
+} SaqueDeposito;
+
+typedef struct {
+    int valor;
+    int conta_origem;
+    int conta_destino;
+    Banco *banco;
+} Transferencia;
+
+typedef enum { LIVRE, OCUPADA } thread_status_t;
+
+typedef struct task {
+    void (*function)(void *);
+    void *arg;
+    struct task *next;
+} task_t;
+
+typedef struct {
+    pthread_t thread;
+    int thread_id;
+    thread_status_t status;
+} worker_thread_t;
+
+typedef struct {
+    int num_threads;
+    worker_thread_t *workers;
+    task_t *internal_tasks;  // Lista de tarefas internas do pool
+    pthread_mutex_t lock;    // Mutex para proteger a lista interna
+    pthread_cond_t cond;     // Condição para as threads esperarem por tarefas
+} thread_pool_t;
+
+int num_accounts;
+
+// Variáveis da fila principal
+task_t *task_queue = NULL;
+task_t *queue_tail = NULL;
+int queue_size = 0;
+
+// Mutex e semáforos para sincronização na fila principal
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+sem_t cheio;  // Indica o número de tarefas disponíveis
+sem_t vazio;  // Indica o número de espaços livres na fila
 
 
-typedef struct Operation {
-    void (*operationFunction)(struct Operation*); 
-    int value;
-    int accountA;
-    int accountB;
-} Operation;
+// INICIALIZAÇÕES
 
-void withdrawal_deposit(Operation* operation) {
-    printf("Saque/depósito de %d reais feito em conta %d\n", operation->value, operation->accountA);
+// Inicializa o banco com contas e mutexes
+void init_banco(Banco *banco, int num_accounts) {
+    banco->contas = malloc(num_accounts * sizeof(Conta));
+    banco->quantidade = num_accounts;
+    for (int i = 0; i < num_accounts; i++) {
+        banco->contas[i].id_conta = i;
+        banco->contas[i].saldo = (rand() % 9901) + 100.0;
+        pthread_mutex_init(&banco->contas[i].conta_mutex, NULL);
+        printf("Conta %d criada com saldo inicial de %.2f\n", banco->contas[i].id_conta, banco->contas[i].saldo);
+    }
 }
 
-void transfer(Operation* operation) {
-    printf("Transferência de %d reais feita de conta %d para conta %d\n", operation->value, operation->accountA, operation->accountB);
+// Inicializa semáforos e mutexes
+void init_sync() {
+    sem_init(&cheio, 0, 0);
+    sem_init(&vazio, 0, MAX_TASKS);
 }
 
-void *client() {
 
-    void* operations[] = {
-        &withdrawal_deposit,
-        &transfer
-    };
+// FUNÇÕES
 
-    for(int i = 0; i<4; i++){
-
-        void* operationFunction = operations[rand() % 2];
-
-        int value;
-        int accountA = rand() % num_accounts;
-        int accountB;
-
-        if(operationFunction==&withdrawal_deposit){
-            value = rand() % 2000 - 1000; // Números negativos também
-        } else {
-            value = rand() % 1000;
-
-            accountB = rand() % num_accounts;
-            // Garante que a transferência será para uma conta diferente
-            while(accountA == accountB){
-                accountB = rand() % num_accounts;
-            }
-        }
-
-        Operation o = {
-            .operationFunction = operationFunction,
-            .value = value, 
-            .accountA = accountA,
-            .accountB = accountB
-        };
-        
-        o.operationFunction(&o);     
-
-        sleep(10);
+// Função de saque ou depósito
+void realizar_saque_deposito(void *arg) {
+    SaqueDeposito *operacao = (SaqueDeposito *)arg;
+    Conta *conta = &operacao->banco->contas[operacao->conta_id];
+    pthread_mutex_lock(&conta->conta_mutex);
+    
+    double novo_saldo = conta->saldo + operacao->valor;
+    if (novo_saldo >= 0) {
+        conta->saldo = novo_saldo;
+        printf("%s de %d na conta %d, Saldo atualizado: %.2f\n", 
+               operacao->valor >= 0 ? "[DEPÓSITO]" : "[SAQUE]", operacao->valor, operacao->conta_id, conta->saldo);
+    } else {
+        printf("Erro: Saldo insuficiente para saque de %d na conta %d (Saldo atual: %.2f)\n", 
+               operacao->valor, operacao->conta_id, conta->saldo);
     }
 
-    pthread_exit(NULL);
+    sleep(4);
+    free(operacao);
+    pthread_mutex_unlock(&conta->conta_mutex);
 }
 
-int main(int argc, char **argv) {
-    pthread_t id_threads[num_clients];
+// Função de transferência
+void realizar_transferencia(void *arg) {
+    Transferencia *operacao = (Transferencia *)arg;
+    Conta *conta_origem = &operacao->banco->contas[operacao->conta_origem];
+    Conta *conta_destino = &operacao->banco->contas[operacao->conta_destino];
 
-    for(int i=0; i<num_clients; i++){
-        if(pthread_create(&id_threads[i], NULL, client, NULL) != 0) {
+    pthread_mutex_lock(&conta_origem->conta_mutex);
+    pthread_mutex_lock(&conta_destino->conta_mutex);
+
+    if (conta_origem->saldo >= operacao->valor) {
+        conta_origem->saldo -= operacao->valor;
+        conta_destino->saldo += operacao->valor;
+        printf("[TRANSFERÊNCIA] de %d da conta %d para a conta %d. Novo saldo origem: %.2f, destino: %.2f\n",
+               operacao->valor, operacao->conta_origem, operacao->conta_destino, conta_origem->saldo, conta_destino->saldo);
+    } else {
+        printf("Erro: Saldo insuficiente para transferência de %d da conta %d para a conta %d\n",
+               operacao->valor, operacao->conta_origem, operacao->conta_destino);
+    }
+
+    sleep(4);
+    free(operacao);
+    pthread_mutex_unlock(&conta_destino->conta_mutex);
+    pthread_mutex_unlock(&conta_origem->conta_mutex);
+}
+
+// Função que exibe o valor de cada uma das contas
+void balanco_geral(void *arg) {
+    Banco *banco = (Banco *)arg;
+    printf("[BALANÇO] das Contas:\n");
+    for (int i = 0; i < banco->quantidade; i++) {
+        printf("Conta ID: %d, Saldo: %.2f\n", banco->contas[i].id_conta, banco->contas[i].saldo);
+    }
+}
+
+
+// FILA
+
+// Adiciona tarefa a fila
+void enqueue_task(void (*function)(void *), void *arg) {
+    sem_wait(&vazio);  // Aguarda espaço disponível
+    pthread_mutex_lock(&queue_mutex);  // Protege o acesso à fila
+
+    task_t *new_task = malloc(sizeof(task_t));
+    new_task->function = function;
+    new_task->arg = arg;
+    new_task->next = NULL;
+
+    if (task_queue == NULL) {
+        task_queue = new_task;
+        queue_tail = new_task;
+    } else {
+        queue_tail->next = new_task;
+        queue_tail = new_task;
+    }
+    queue_size++;
+
+    printf("[ENQUEUE] Tarefa adicionada. Tamanho da fila: %d\n", queue_size);
+
+    pthread_mutex_unlock(&queue_mutex);  // Libera o acesso à fila
+    sem_post(&cheio);  // Sinaliza que há uma nova tarefa disponível
+}
+
+// Desenfileira uma tarefa da fila principal
+task_t *dequeue_task() {
+    sem_wait(&cheio);  // Aguarda uma tarefa disponível
+    pthread_mutex_lock(&queue_mutex);  // Protege o acesso à fila
+
+    task_t *task = task_queue;
+    task_queue = task_queue->next;
+    if (task_queue == NULL) {
+        queue_tail = NULL;
+    }
+    queue_size--;
+
+    printf("[DEQUEUE] Tarefa removida. Tamanho da fila: %d\n", queue_size);
+
+    pthread_mutex_unlock(&queue_mutex);  // Libera o acesso à fila
+    sem_post(&vazio);  // Sinaliza que há espaço disponível
+
+    return task;
+}
+
+
+// Thread produtora que gera as operações e adiciona na fila
+void *client_thread(void *arg) {
+    Banco *banco = (Banco *)arg;
+    unsigned int seed = time(NULL) ^ pthread_self(); // Usar uma seed diferente para cada thread
+
+    while (1) {
+        int operacao_tipo = rand_r(&seed) % 2;
+        int contaA = rand_r(&seed) % num_accounts;
+        int valor;
+
+        if (operacao_tipo == 0) {
+            valor = (rand_r(&seed) % 2000) - 1000;
+            SaqueDeposito *dados_operacao = malloc(sizeof(SaqueDeposito));
+            dados_operacao->valor = valor;
+            dados_operacao->conta_id = contaA;
+            dados_operacao->banco = banco;
+            enqueue_task(realizar_saque_deposito, (void *)dados_operacao);
+        } else {
+            int contaB;
+            do {
+                contaB = rand_r(&seed) % num_accounts;
+            } while (contaA == contaB);
+
+            valor = rand_r(&seed) % 1000;
+            Transferencia *dados_operacao = malloc(sizeof(Transferencia));
+            dados_operacao->valor = valor;
+            dados_operacao->conta_origem = contaA;
+            dados_operacao->conta_destino = contaB;
+            dados_operacao->banco = banco;
+            enqueue_task(realizar_transferencia, (void *)dados_operacao);
+        }
+
+        sleep(4);
+    }
+}
+
+
+// Executa uma tarefa no pool de threads
+void submit_thread_pool(thread_pool_t *pool, task_t *task) {
+    pthread_mutex_lock(&pool->lock);
+
+    task->next = pool->internal_tasks;
+    pool->internal_tasks = task;
+
+    printf("[SERVIDOR] Tarefa adicionada à lista interna do pool.\n");
+
+    int count = 0;
+    task_t *current = pool->internal_tasks;
+    while (current != NULL) {
+        count++;
+        current = current->next;
+    }
+    printf("[POOL] %d tarefa(s) no pool.\n", count);
+
+    pthread_cond_signal(&pool->cond);  // Notifica as threads trabalhadoras
+    pthread_mutex_unlock(&pool->lock);
+}
+
+// Thread servidor que pega tarefas da fila principal e passa para o pool
+void *server_thread(void *arg) {
+    void **args = (void **)arg;  // Converte o ponteiro de entrada para um array de void *
+    thread_pool_t *pool = (thread_pool_t *)args[0];  
+    Banco *banco = (Banco *)args[1];
+
+    for(int i=0; i<11; i++){
+        if(i<10){
+            task_t *task = dequeue_task();
+            submit_thread_pool(pool, task);
+        } else { 
+            // Cria uma tarefa para o balanço geral
+            task_t *tarefa_balanco = malloc(sizeof(task_t));
+            tarefa_balanco->function = balanco_geral;
+            tarefa_balanco->arg = (void *)banco;
+            submit_thread_pool(pool, tarefa_balanco);
+            i = -1;
+        }
+    }
+}
+
+
+// Função trabalhadora que executa tarefas do pool
+void *worker_thread(void *arg) {
+    thread_pool_t *pool = (thread_pool_t *)arg;
+
+    // Identifica a thread que está executando
+    int thread_id = -1;
+    for (int i = 0; i < pool->num_threads; ++i) {
+        if (pthread_equal(pthread_self(), pool->workers[i].thread)) {
+            thread_id = pool->workers[i].thread_id;
+            break;
+        }
+    }
+
+    while (1) {
+        pthread_mutex_lock(&pool->lock);
+
+        // Espera até que haja uma tarefa ou o pool seja desligado
+        while (pool->internal_tasks == NULL) {
+            pthread_cond_wait(&pool->cond, &pool->lock);
+        }
+
+        // Pega a próxima tarefa da lista interna
+        task_t *task = pool->internal_tasks;
+        pool->internal_tasks = task->next;
+
+        // Marca a thread como OCUPADA e imprime o status
+        pool->workers[thread_id].status = OCUPADA;
+        printf("[TRABALHADORA] Thread %d executando tarefa...\n", thread_id);
+
+        pthread_mutex_unlock(&pool->lock);
+
+        // Executa a tarefa
+        task->function(task->arg);
+
+        // Libera a memória da tarefa
+        free(task);
+
+        // Marca a thread como LIVRE e imprime o status
+        pthread_mutex_lock(&pool->lock);
+        pool->workers[thread_id].status = LIVRE;
+        printf("[TRABALHADORA] Thread %d está LIVRE.\n", thread_id);
+        pthread_mutex_unlock(&pool->lock);
+    }
+}
+
+
+// Inicializa o pool de threads
+void thread_pool_init(thread_pool_t *pool, int num_threads) {
+    pool->num_threads = num_threads;
+    pool->workers = malloc(sizeof(worker_thread_t) * num_threads);
+    pool->internal_tasks = NULL;
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->cond, NULL);
+
+    for (int i = 0; i < num_threads; ++i) {
+        pool->workers[i].thread_id = i;
+        pool->workers[i].status = LIVRE;
+        pthread_create(&pool->workers[i].thread, NULL, worker_thread, pool);
+    }
+}
+
+// Destroi semáforos e mutexes
+void destroy_sync() {
+    sem_destroy(&cheio);
+    sem_destroy(&vazio);
+    pthread_mutex_destroy(&queue_mutex);
+}
+
+void thread_pool_destroy(thread_pool_t *pool) {
+    // Adquire o lock para sinalizar o shutdown
+    pthread_mutex_lock(&pool->lock);
+
+    // Sinaliza que o pool está em processo de desligamento
+    for (int i = 0; i < pool->num_threads; ++i) {
+        printf("[POOL] Finalizando thread %d...\n", pool->workers[i].thread_id);
+    }
+    
+    pthread_cond_broadcast(&pool->cond);  // Libera todas as threads que estão aguardando
+    pthread_mutex_unlock(&pool->lock);
+
+    // Aguarda a finalização de todas as threads
+    for (int i = 0; i < pool->num_threads; ++i) {
+        pthread_join(pool->workers[i].thread, NULL);
+        printf("[POOL] Thread %d finalizada.\n", pool->workers[i].thread_id);
+    }
+
+    // Libera as tarefas restantes da lista interna, se houver
+    pthread_mutex_lock(&pool->lock);
+    task_t *current_task = pool->internal_tasks;
+    while (current_task != NULL) {
+        task_t *next_task = current_task->next;
+        free(current_task);  // Libera a memória da tarefa
+        current_task = next_task;
+    }
+    pthread_mutex_unlock(&pool->lock);
+
+    // Libera a memória dos workers e destrói os recursos do pool
+    free(pool->workers);
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->cond);
+
+    printf("[POOL] Pool de threads destruído com sucesso.\n");
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "É preciso inserir: %s <num_clientes> <num_contas>\n", argv[0]);
+        return 1;
+    }
+
+    int num_clients = atoi(argv[1]);
+    num_accounts = atoi(argv[2]);
+
+    Banco banco;
+    init_banco(&banco, num_accounts);
+
+    pthread_t id_threads[num_clients];
+    for (int i = 0; i < num_clients; i++) {
+        if (pthread_create(&id_threads[i], NULL, client_thread, &banco) != 0) {
             fprintf(stderr, "Erro ao criar thread %u\n", i);
             exit(EXIT_FAILURE);
         }
     }
 
-    for (int i = 0; i < num_clients; i++) {
-        pthread_join(id_threads[i], NULL); 
+    init_sync();
+
+    thread_pool_t pool;
+    thread_pool_init(&pool, NUM_THREADS);
+
+    void **args = malloc(2 * sizeof(void *));
+    args[0] = (void *)&pool;  
+    args[1] = (void *)&banco;
+    pthread_t server;
+    pthread_create(&server, NULL, server_thread, (void *)args);
+
+    for (int i = 0; i < num_clients; ++i) {
+        pthread_join(id_threads[i], NULL);
     }
+
+    pthread_join(server, NULL);
+    thread_pool_destroy(&pool);
+    destroy_sync();
 
     return 0;
 }
